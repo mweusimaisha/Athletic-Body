@@ -1,5 +1,5 @@
 # Minimal static server for local testing: http://localhost:8765/
-$root = Join-Path $PSScriptRoot 'athletic-body-project'
+$root = $PSScriptRoot
 $l = New-Object Net.HttpListener
 $l.Prefixes.Add('http://localhost:8765/')
 $l.Start()
