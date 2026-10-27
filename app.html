@@ -496,7 +496,7 @@ const SCHED_V1={0:'upperA',1:'recovery',2:'upperB',3:'rest',4:'full',5:'recovery
 
 /* ================= state ================= */
 function defaults(){
-  return {version:4,created:today(),
+  return {version:5,created:today(),
     profile:{name:'',heightCm:188,startWeightKg:206/2.20462,startDate:today(),
       units:{weight:'lb',length:'in',distance:'mi'},
       targets:{kcal:2500,protein:180,carbs:280,fat:73,waterMl:3000,steps:5000,gym:5,stretchMin:10},
@@ -505,7 +505,7 @@ function defaults(){
       thighRef:{g:180,p:47,kcal:376,f:19.6}},
     foods:clone(FOODS),log:[],days:{},activity:[],workouts:[],measurements:[],
     portions:[{id:'p1',name:'2 baked thighs, skin removed',o:{count:2,mode:'none',w:'',bone:'bonein',skin:'on',skinEaten:'no',method:'baked'}}],
-    plan:clone(PLAN_SEED),schedule:clone(SCHED_SEED),templates:{},grocery:{},planSkip:{},
+    plan:clone(PLAN_SEED),schedule:clone(SCHED_SEED),templates:{},grocery:{},planSkip:{},planOverride:{},
     prep:{selected:['rice','beans','thigh','egg','gbeef','efo','oats','corn','pasta'],autoFrom:today()}};
 }
 function migrate(s){
@@ -515,7 +515,7 @@ function migrate(s){
   out.profile={...d.profile,...sp,units:{...d.profile.units,...(sp.units||{})},targets:{...d.profile.targets,...(sp.targets||{})},
     mealTimes:{...d.profile.mealTimes,...(sp.mealTimes||{})},clearance:{...d.profile.clearance,...(sp.clearance||{})},thighRef:{...d.profile.thighRef,...(sp.thighRef||{})}};
   ['foods','log','activity','workouts','measurements','portions'].forEach(k=>{if(!Array.isArray(out[k]))out[k]=d[k];});
-  ['days','templates','grocery','schedule','planSkip','prep'].forEach(k=>{if(!out[k]||typeof out[k]!=='object'||Array.isArray(out[k]))out[k]=d[k];});
+  ['days','templates','grocery','schedule','planSkip','planOverride','prep'].forEach(k=>{if(!out[k]||typeof out[k]!=='object'||Array.isArray(out[k]))out[k]=d[k];});
   if(!Array.isArray(out.plan)||out.plan.length!==7)out.plan=d.plan;
   FOODS.forEach(b=>{if(!out.foods.some(x=>x.id===b.id))out.foods.push(clone(b));});
   if((s.version||1)<2){
@@ -525,8 +525,21 @@ function migrate(s){
   }
   if(!Array.isArray(out.prep.selected))out.prep.selected=d.prep.selected;
   if(!out.prep.autoFrom)out.prep.autoFrom=today();
-  if((s.version||1)<4)out.profile.autoLog=false; // meals log only when tapped (Settings can turn automatic logging back on)
-  out.version=4;
+  if((s.version||1)<4){
+    // meals log only when tapped; drop plan meals the old version logged on its own, since they were never confirmed as eaten
+    out.profile.autoLog=false;
+    out.log=out.log.filter(e=>!(e.auto&&!e.sub&&!e.sample));
+  }
+  if((s.version||1)<5){
+    // swaps made before the meal was eaten become planned swaps (not eaten) instead of logged meals
+    const t=today(),now=nowTime();
+    out.log=out.log.filter(e=>{if(!e.sub||!e.planKey||e.sample)return true;const [d,slot]=e.planKey.split('|');
+      const early=d>t||(d===t&&now<(out.profile.mealTimes[slot]||'00:00'));if(!early)return true;
+      if(e.items)out.planOverride[e.planKey]={items:e.items,note:(e.notes||'').split(':')[0]+': '};
+      else{const x={...e};delete x.id;delete x.planKey;delete x.sub;out.planOverride[e.planKey]={entry:x};}
+      return false;});
+  }
+  out.version=5;
   return out;
 }
 let S, storageOK=true, firstRun=false;
@@ -726,20 +739,33 @@ function vHome(){
   <section class="card"><div class="card-h"><h3>This week</h3><span class="small muted">${fmtDate(mondayOf(d),{month:'short',day:'numeric'})} – ${fmtDate(addDays(mondayOf(d),6),{month:'short',day:'numeric'})}</span></div>${weekBars(d)}</section>`;
 }
 function planSlotState(date,slot){const key=date+'|'+slot;const e=S.log.find(x=>x.planKey===key);
-  if(e)return {key,e,st:e.sub?'sub':'logged'};if(S.planSkip[key])return {key,st:'skipped'};
-  if(S.profile.autoLog&&!mealDue(date,slot))return {key,st:'upcoming'};return {key,st:'open'};}
+  if(e)return {key,e,st:e.sub?'sub':'logged'};if(S.planSkip[key])return {key,st:'skipped'};const ov=ovOf(key);
+  if(S.profile.autoLog&&!mealDue(date,slot))return {key,ov,st:'upcoming'};if(date>today())return {key,ov,st:'planned'};return {key,ov,st:'open'};}
 const isFast=key=>S.planSkip[key]==='fast';
+/* a swap made before eating only changes that meal in the plan; it is logged when you tap Ate it */
+const ovOf=key=>S.planOverride[key]||null;
+const ovName=ov=>ov.items?ov.items.map(it=>foodById(it[0])?.name||'?').join(', '):ov.entry.name;
+const ovKcal=ov=>ov.items?itemsMacros(ov.items).kcal:+ov.entry.kcal||0;
+function ovEntry(key,ov,extra={}){const [d,slot]=key.split('|');
+  if(ov.items)return itemsEntry(d,slot,ov.items,ov.note||'Swapped: ',{sub:true,...extra});
+  return {...clone(ov.entry),id:uid(),date:d,meal:slot,planKey:key,sub:true,...extra};}
 /* a fasting day: every planned meal is fasted, apart from any you substituted (food you actually ate) */
 const dayFasted=d=>{const keys=PSLOTS.map(s=>d+'|'+s);return keys.some(isFast)&&keys.every(k=>isFast(k)||S.log.some(e=>e.planKey===k&&e.sub));};
-function statusPill(s){if(s.st==='skipped'&&isFast(s.key))return '<span class="pill">Fasted</span>';return {logged:'<span class="pill good">Logged</span>',sub:'<span class="pill warn">Substituted</span>',skipped:'<span class="pill">Skipped</span>',upcoming:'<span class="pill">Logs at meal time</span>',open:'<span class="pill">Not eaten yet</span>'}[s.st];}
+function statusPill(s){if(s.st==='skipped'&&isFast(s.key))return '<span class="pill">Fasted</span>';
+  if(s.ov&&(s.st==='open'||s.st==='upcoming'))return '<span class="pill warn">Swapped · not eaten yet</span>';if(s.ov&&s.st==='planned')return '<span class="pill warn">Swapped</span>';return {logged:'<span class="pill good">Logged</span>',sub:'<span class="pill warn">Substituted</span>',skipped:'<span class="pill">Skipped</span>',upcoming:'<span class="pill">Logs at meal time</span>',planned:'<span class="pill">Planned</span>',open:'<span class="pill">Not eaten yet</span>'}[s.st];}
 function slotActions(s){const k=s.key;
   if(s.st==='skipped')return `<button class="btn sm" data-act="subReset" data-key="${k}">${isFast(k)?'Undo fast':'Undo skip'}</button>`;
-  return `${s.st==='open'?`<button class="btn sm primary" data-act="eatPlanned" data-key="${k}">${I.check} Ate it</button>`:''}<button class="btn sm" data-act="subMeal" data-key="${k}">Substitute</button><button class="btn sm" data-act="subFast" data-key="${k}">Fasted</button>${s.st==='sub'?`<button class="btn sm ghost" data-act="subReset" data-key="${k}">Back to plan</button>`:''}${s.st==='logged'&&!S.profile.autoLog?`<button class="btn sm ghost" data-act="unlog" data-key="${k}">Undo</button>`:''}`;}
+  const ovBtns=s.ov?`<button class="btn sm" data-act="subMeal" data-key="${k}">Change swap</button><button class="btn sm ghost" data-act="ovClear" data-key="${k}">Use planned meal</button>`:`<button class="btn sm" data-act="subMeal" data-key="${k}">Substitute</button>`;
+  if(s.st==='planned')return `${ovBtns}<button class="btn sm ghost" data-act="subFast" data-key="${k}">Plan to fast</button>`;
+  if(s.st==='open'&&s.ov)return `<button class="btn sm primary" data-act="eatPlanned" data-key="${k}">${I.check} Ate it</button>${ovBtns}<button class="btn sm" data-act="subFast" data-key="${k}">Fasted</button>`;
+  // substituted meals already count as eaten: offer to change it, switch to the planned meal, or clear it
+  if(s.st==='sub')return `<button class="btn sm" data-act="subMeal" data-key="${k}">Change substitute</button><button class="btn sm" data-act="subReset" data-key="${k}">${I.check} Ate the planned meal</button><button class="btn sm ghost" data-act="unlog" data-key="${k}">Undo (not eaten)</button>`;
+  return `${s.st==='open'?`<button class="btn sm primary" data-act="eatPlanned" data-key="${k}">${I.check} Ate it</button>`:''}<button class="btn sm" data-act="subMeal" data-key="${k}">Substitute</button><button class="btn sm" data-act="subFast" data-key="${k}">Fasted</button>${s.st==='logged'&&!S.profile.autoLog?`<button class="btn sm ghost" data-act="unlog" data-key="${k}">Undo</button>`:''}`;}
 function todaysMeals(d){
   const plan=S.plan[wdIdx(d)];const road=S.profile.mode==='road';
   const rows=PSLOTS.map(slot=>{const s=planSlotState(d,slot),m=plan[slot];
-    const label=s.e?s.e.name:(road?'Road: '+m.road:m.items.map(it=>foodById(it[0])?.name||'?').join(', '));
-    const kc=s.e?s.e.kcal:itemsMacros(m.items).kcal;const extra=dayLog(d).filter(e=>e.meal===slot&&!e.planKey);
+    const label=s.e?s.e.name:s.ov?ovName(s.ov):(road?'Road: '+m.road:m.items.map(it=>foodById(it[0])?.name||'?').join(', '));
+    const kc=s.e?s.e.kcal:s.ov?ovKcal(s.ov):itemsMacros(m.items).kcal;const extra=dayLog(d).filter(e=>e.meal===slot&&!e.planKey);
     return `<div class="todaymeal" style="flex-wrap:wrap"><span class="tm">${fmtTime(S.profile.mealTimes[slot])}</span><div class="info"><div><b>${SLOT_L[slot]}</b> ${statusPill(s)}</div><div class="small muted">${s.st==='skipped'?(isFast(s.key)?'Fasted':'Skipped'):esc(label)+` · <span class="num">${fmt(kc)} kcal</span>`}</div>${extra.length?`<div class="small">+ ${extra.map(e=>esc(e.name)).join(', ')}</div>`:''}</div><div class="row" style="width:100%;padding-left:72px">${slotActions(s)}</div></div>`;}).join('');
   const ex=dayLog(d).filter(e=>e.meal==='extra');
   const allFast=dayFasted(d);
@@ -781,7 +807,7 @@ function vFoodLog(){
 }
 function entryRow(e){
   const q=e.qty!=null&&e.qty!==''?qtyStr(e.qty,e.unit||''):'';
-  return `<div class="entry"><div class="entry-main"><div class="entry-name">${esc(e.name)} ${e.est?'<span class="badge est" title="Estimated values">Est.</span>':''} ${e.sample?'<span class="badge">Sample</span>':''} ${e.sub?'<span class="badge">Substituted</span>':e.auto?'<span class="badge ok">From plan</span>':''}</div>
+  return `<div class="entry"><div class="entry-main"><div class="entry-name">${esc(e.name)} ${e.est?'<span class="badge est" title="Estimated values">Est.</span>':''} ${e.sample?'<span class="badge">Sample</span>':''} ${e.sub?'<span class="badge">Substituted</span>':(e.auto||e.tapped)?'<span class="badge ok">From plan</span>':''}</div>
   ${e.planKey&&!e.sample?`<button class="btn sm" style="margin:4px 0" data-act="subMeal" data-key="${e.planKey}">Substitute</button>`:''}
   <div class="small muted">${[q,e.state,e.cuisine,e.time?fmtTime(e.time):''].filter(Boolean).map(esc).join(' · ')}</div>
   <div class="macros small num"><b>${fmt(e.kcal)}</b> kcal · P ${f1(e.p)} · C ${f1(e.c)} · F ${f1(e.f)}</div>${e.notes?`<div class="note small">${esc(e.notes)}</div>`:''}</div>
@@ -886,7 +912,7 @@ function vPlanWeek(){
       return `<div class="planitem"><span class="nm">${fd?esc(fd.name):'<i class="muted">Food was deleted</i>'}<span class="tiny muted num" style="display:block">${fmt(mm.kcal)} kcal · ${f1(mm.p)} g P</span></span><input type="number" inputmode="decimal" min="0" step="any" value="${q}" data-chg="planQty" data-day="${i}" data-slot="${slot}" data-i="${k}" aria-label="Portion of ${fd?esc(fd.name):'item'}"><span class="u">${fd?esc(fd.bu==='piece'?'pcs':fd.bu):''}</span><button class="iconbtn sm" data-act="planRm" data-day="${i}" data-slot="${slot}" data-i="${k}" aria-label="Remove">${I.x}</button></div>`;}).join('')}
     <button class="btn sm ghost" data-act="planAdd" data-day="${i}" data-slot="${slot}" style="margin-top:4px">${I.plus} Add food</button></div>
     <div class="subs"><div><b>Nigerian option</b>${esc(m.ng)}</div><div><b>American option</b>${esc(m.am)}</div><div class="${road?'hl':''}"><b>On the road</b>${esc(m.road)}</div>${m.prep?`<div><b>Prep note</b>${esc(m.prep)}</div>`:''}</div>
-    ${(()=>{const s=planSlotState(date,slot);return `<div class="row between" style="margin-top:10px"><span>${statusPill(s)}${s.st==='upcoming'?` <span class="tiny muted">${date===today()?'today at '+fmtTime(S.profile.mealTimes[slot]):fmtDate(date)}</span>`:''}${s.st==='sub'?` <span class="tiny muted">${esc(s.e.name)}</span>`:''}</span><div class="row">${slotActions(s)}</div></div>`;})()}</section>`;}).join('')}
+    ${(()=>{const s=planSlotState(date,slot);return `<div class="row between" style="margin-top:10px"><span>${statusPill(s)}${s.st==='upcoming'?` <span class="tiny muted">${date===today()?'today at '+fmtTime(S.profile.mealTimes[slot]):fmtDate(date)}</span>`:''}${s.st==='sub'?` <span class="tiny muted">${esc(s.e.name)}</span>`:''}${s.ov&&!s.e?` <span class="tiny muted">→ ${esc(ovName(s.ov))} · ${fmt(ovKcal(s.ov))} kcal</span>`:''}</span><div class="row">${slotActions(s)}</div></div>`;})()}</section>`;}).join('')}
   <section class="card"><h3>Load a different plan</h3><p class="small muted" style="margin-top:0">This replaces all 7 days. Your food log isn’t affected.</p>
   <div class="row"><button class="btn sm primary" data-act="sub" data-key="plan" data-v="prep">Build from what I cooked</button><button class="btn sm" data-act="shakeBreakfasts">Make every breakfast a shake</button><button class="btn sm" data-act="loadPlan" data-v="sample">Sample plan</button><button class="btn sm ghost" data-act="editTimes">Edit meal times</button></div></section>`;
 }
@@ -1041,20 +1067,21 @@ function prepPreview(draft){
   <h3 style="margin-top:12px">Amount needed for the week</h3><p class="small muted" style="margin-top:0">Cooked weights. Compare with what you made; if you made less of something, lower its portions in the 7-day plan afterwards.</p>
   ${Object.entries(st.agg).map(([id,q])=>{const fd=foodById(id);if(!fd)return '';return `<div class="kv"><span>${esc(fd.name)}</span><span class="num">${fd.bu==='g'?(q>=1000?r1(q/1000)+' kg':Math.round(q)+' g'):qtyStr(q,fd.bu)}</span></div>`;}).join('')}
   <button class="btn primary block" style="margin-top:12px" data-act="usePrep">Use this plan</button>
-  <p class="hint">This replaces your 7-day plan. Meals log themselves at meal time; tap Substitute when you eat something else.</p></section>`;
+  <p class="hint">This replaces your 7-day plan. Tap Ate it under each meal when you eat it.</p></section>`;
 }
 function subForm(key){
   const [date,slot]=key.split('|');const e=S.log.find(x=>x.planKey===key);const m=S.plan[wdIdx(date)][slot];
-  const items=e&&e.items&&!e.sub?e.items:m.items;const grp=r=>r==='mixed'?'carb':r;
+  const ov=ovOf(key);const items=e&&e.items&&!e.sub?e.items:(!e&&ov&&ov.items?ov.items:m.items);const grp=r=>r==='mixed'?'carb':r;
   const rows=items.map(([id,q],k)=>{const fd=foodById(id);if(!fd)return '';const g=grp(prepRole(fd));
     const alts=S.foods.filter(f=>f.id!==id&&grp(prepRole(f))===g).sort((a,b)=>(a.cuisine+a.name).localeCompare(b.cuisine+b.name));
     return `<div class="field"><label for="sw${k}">${esc(itemLabel([id,q]))}</label>${sel('sw_'+k,[['','Keep as planned'],...alts.map(f=>[f.id,`${f.name} · ${f.cuisine}`])],'',`id="sw${k}"`)}</div>`;}).join('');
   return `<form class="form" data-form="sub" novalidate><input type="hidden" name="key" value="${esc(key)}">
   <p class="small muted" style="margin:0">${fmtDate(date)} · planned: ${esc(items.map(it=>itemLabel(it)).join(', '))}</p>
+  <div class="banner info small">${e?'You’ve already logged this meal, so a swap replaces what was logged.':'You haven’t eaten this yet, so a swap only changes the plan. It isn’t counted until you tap <b>Ate it</b>.'}</div>
   <div class="subs" style="margin:0"><div><b>Nigerian option</b>${esc(m.ng)}</div><div><b>American option</b>${esc(m.am)}</div><div><b>On the road</b>${esc(m.road)}</div></div>
   <h3>Swap a food</h3>${rows}<p class="hint" style="margin:0">Swapped foods keep about the same calories, so you don’t need to work out portions.</p>
   <p class="form-err" hidden></p><button class="btn primary" type="submit">Save swap</button>
-  <hr class="sep"><div class="row"><button type="button" class="btn sm" data-act="subOther" data-key="${esc(key)}">Ate something else</button><button type="button" class="btn sm" data-act="subFast" data-key="${esc(key)}">Fasted</button><button type="button" class="btn sm" data-act="subSkip" data-key="${esc(key)}">Skipped this meal</button>${e&&e.sub?`<button type="button" class="btn sm ghost" data-act="subReset" data-key="${esc(key)}">Back to plan</button>`:''}</div></form>`;
+  <hr class="sep"><div class="row"><button type="button" class="btn sm" data-act="subOther" data-key="${esc(key)}">${e?'Ate something else':'Swap for something else'}</button><button type="button" class="btn sm" data-act="subFast" data-key="${esc(key)}">Fasted</button><button type="button" class="btn sm" data-act="subSkip" data-key="${esc(key)}">Skipped this meal</button>${e&&e.sub?`<button type="button" class="btn sm ghost" data-act="subReset" data-key="${esc(key)}">Ate the planned meal</button>`:''}</div></form>`;
 }
 
 /* ---------- TRAIN ---------- */
@@ -1465,21 +1492,22 @@ const A={
   reviewWeek:el=>{ui.reviewWeek=addDays(ui.reviewWeek,+el.dataset.v);render();},
   eatPlanned:el=>{const [d,slot]=el.dataset.key?el.dataset.key.split('|'):[today(),el.dataset.slot];const key=d+'|'+slot;
     if(S.log.some(e=>e.planKey===key)){toast('Already logged');return;}
-    delete S.planSkip[key];S.log.push(planMealEntry(d,slot,{auto:true}));commit(`${SLOT_L[slot]} logged from your plan`);},
+    delete S.planSkip[key];const ov=ovOf(key);S.log.push(ov?ovEntry(key,ov,{tapped:true}):planMealEntry(d,slot,{tapped:true}));commit(`${SLOT_L[slot]} logged as eaten`);},
+  ovClear:el=>{delete S.planOverride[el.dataset.key];closeModal();commit('Back to the planned meal');},
   subMeal:el=>{const key=el.dataset.key;openModal('Substitute '+SLOT_L[key.split('|')[1]].toLowerCase(),subForm(key));},
   subOther:el=>{const key=el.dataset.key;const [d,slot]=key.split('|');const m=S.plan[wdIdx(d)][slot];const road=S.profile.mode==='road';
     openModal('What did you eat instead?',foodForm({date:d,meal:slot,replaceKey:key,name:road?m.road:'',cuisine:road?'American':'Nigerian',notes:road?'Road option. Enter label or restaurant values.':''}));},
-  subFast:el=>{const key=el.dataset.key;S.log=S.log.filter(e=>e.planKey!==key);S.planSkip[key]='fast';closeModal();commit(`${SLOT_L[key.split('|')[1]]} marked as fasted`);},
+  subFast:el=>{const key=el.dataset.key;S.log=S.log.filter(e=>e.planKey!==key);delete S.planOverride[key];S.planSkip[key]='fast';closeModal();commit(`${SLOT_L[key.split('|')[1]]} marked as fasted`);},
   fastDay:el=>{const d=el.dataset.date;const keys=PSLOTS.map(s=>d+'|'+s);
     if(dayFasted(d)){keys.forEach(k=>{if(isFast(k))delete S.planSkip[k];});commit('Fasting day undone. Planned meals will log as usual.');return;}
     confirmBox(`Mark all of ${d===today()?'today':fmtDate(d)}’s planned meals as fasted? Any planned meals already logged for the day are removed. Food you logged yourself stays.`,'Fasting today',()=>{
       S.log=S.log.filter(e=>!(e.planKey&&keys.includes(e.planKey)&&!e.sub));keys.forEach(k=>{if(!S.log.some(e=>e.planKey===k))S.planSkip[k]='fast';});
       commit('Fasting day logged. Keep drinking water, and ease off hard training today.');});},
   subSkip:el=>{const key=el.dataset.key;S.log=S.log.filter(e=>e.planKey!==key);S.planSkip[key]=true;closeModal();commit('Marked as skipped');},
-  subReset:el=>{const key=el.dataset.key;const [d,slot]=key.split('|');const wasSub=S.log.some(e=>e.planKey===key&&e.sub);S.log=S.log.filter(e=>e.planKey!==key);delete S.planSkip[key];
+  subReset:el=>{const key=el.dataset.key;const [d,slot]=key.split('|');const wasSub=S.log.some(e=>e.planKey===key&&e.sub);S.log=S.log.filter(e=>e.planKey!==key);delete S.planSkip[key];if(wasSub)delete S.planOverride[key];
     // automatic mode re-logs once the meal is due; tap mode only re-logs when undoing a substitute (you ate the plan after all)
-    if(S.profile.autoLog?mealDue(d,slot):wasSub)S.log.push(planMealEntry(d,slot,{auto:true}));closeModal();commit(wasSub?'Back to the planned meal':'Undone');},
-  unlog:el=>{const key=el.dataset.key;S.log=S.log.filter(e=>e.planKey!==key);commit('Meal un-logged');},
+    if(S.profile.autoLog?mealDue(d,slot):wasSub)S.log.push(planMealEntry(d,slot,S.profile.autoLog?{auto:true}:{tapped:true}));closeModal();commit(wasSub?'Back to the planned meal':'Undone');},
+  unlog:el=>{const key=el.dataset.key;S.log=S.log.filter(e=>e.planKey!==key);closeModal();commit('Marked as not eaten');},
   clearSamples:()=>confirmBox('Remove all sample entries? Your own entries stay.','Clear samples',()=>{S.log=S.log.filter(x=>!x.sample);S.activity=S.activity.filter(x=>!x.sample);S.workouts=S.workouts.filter(x=>!x.sample);S.measurements=S.measurements.filter(x=>!x.sample);Object.keys(S.days).forEach(k=>{if(S.days[k].sample)delete S.days[k];});commit('Sample data cleared. Ready for your own entries.');}),
   resetAll:()=>confirmBox('Erase all data on this device, including your food log, workouts, measurements and photos? Export a backup first if you want to keep anything. This cannot be undone.','Erase everything',()=>{S=defaults();commit('All data erased');}),
   exp:el=>doExport(el.dataset.kind,el.dataset.mode),
@@ -1541,7 +1569,10 @@ const FORMS={
     const bq=+fd.get('ref_bq');if(bq)e.ref={bq,bu:fd.get('ref_bu'),kcal:+fd.get('ref_kcal'),p:+fd.get('ref_p'),c:+fd.get('ref_c'),f:+fd.get('ref_f')};
     const i=S.log.findIndex(x=>x.id===e.id);
     const rk=fd.get('replaceKey');
-    if(rk){S.log=S.log.filter(x=>x.planKey!==rk);e.planKey=rk;e.sub=true;S.log.push(e);delete S.planSkip[rk];closeModal();commit('Substitute logged');return;}
+    if(rk){delete S.planSkip[rk];
+      // already eaten: replace what was logged. Not eaten yet: only change the plan until you tap Ate it
+      if(S.log.some(x=>x.planKey===rk)){S.log=S.log.filter(x=>x.planKey!==rk);e.planKey=rk;e.sub=true;S.log.push(e);closeModal();commit('Substitute logged');return;}
+      const x={...e};delete x.id;S.planOverride[rk]={entry:x};closeModal();commit('Swapped. Tap Ate it when you eat it.');return;}
     if(i>=0){const old=S.log[i];if(old.planKey&&old.date===e.date&&old.meal===e.meal){e.planKey=old.planKey;e.sub=true;}S.log[i]=e;}else S.log.push(e);
     ui.date=e.date;closeModal();commit('Saved');
   },
@@ -1566,14 +1597,15 @@ const FORMS={
   },
   sub:(fd)=>{
     const key=fd.get('key');const [date,slot]=key.split('|');const e=S.log.find(x=>x.planKey===key);const m=S.plan[wdIdx(date)][slot];
-    const base=e&&e.items&&!e.sub?e.items:m.items;const changes=[];
+    const ov=ovOf(key);const base=e&&e.items&&!e.sub?e.items:(!e&&ov&&ov.items?ov.items:m.items);const changes=[];
     const items=base.map(([id,q],k)=>{const nid=fd.get('sw_'+k);if(!nid)return [id,q];const a=foodById(id),b=foodById(nid);if(!a||!b)return [id,q];
       const ka=a.kcal/(a.bq||1),kb=b.kcal/(b.bq||1);let nq=kb>0?q*ka/kb:q;
       nq=b.bu==='g'?Math.max(10,Math.round(nq/10)*10):b.bu==='piece'?Math.max(1,Math.round(nq)):Math.max(.5,Math.round(nq*2)/2);
       changes.push(`${a.name} → ${b.name}`);return [nid,nq];});
     if(!changes.length)throw new VErr('Choose a food to swap, or tap “Ate something else”.');
-    S.log=S.log.filter(x=>x.planKey!==key);delete S.planSkip[key];
-    S.log.push(itemsEntry(date,slot,items,`Swapped ${changes.join(', ')}: `,{sub:true}));closeModal();commit('Swap logged');
+    delete S.planSkip[key];const note=`Swapped ${changes.join(', ')}: `;
+    if(!e){S.planOverride[key]={items,note};closeModal();commit('Swapped. Tap Ate it when you eat it.');return;}
+    S.log=S.log.filter(x=>x.planKey!==key);S.log.push(itemsEntry(date,slot,items,note,{sub:true}));closeModal();commit('Swap logged');
   },
   tpl:(fd,f)=>{
     const name=(fd.get('name')||'').toString().trim();if(!name)throw new VErr('Give the workout type a name.');
